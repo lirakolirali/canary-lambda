@@ -1,0 +1,193 @@
+name: Canary Deploy to Lambda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**"
+
+env:
+  FUNCTION_NAME: cicd_test_lambda
+  ALIAS_NAME: live
+  AWS_REGION: ap-northeast-1
+  # カナリアに流すトラフィック割合 (0.1 = 10%)
+  CANARY_WEIGHT: "0.1"
+  # カナリア監視時間（PoC: 60秒 / 本番: 300秒推奨）
+  CANARY_WAIT_SEC: "60"
+
+jobs:
+  # ──────────────────────────────────────────
+  # Job 1: テスト
+  # ──────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ──────────────────────────────────────────
+  # Job 2: カナリアデプロイ
+  # ──────────────────────────────────────────
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Step 1: パッケージ作成 ──
+      - name: Zip Lambda package
+        run: |
+          cd src
+          zip -r ../function.zip .
+          echo "Package size: $(du -sh ../function.zip | cut -f1)"
+
+      # ── Step 2: デプロイ & バージョン発行 ──
+      - name: Deploy new Lambda version
+        id: deploy
+        run: |
+          aws lambda update-function-code \
+            --function-name $FUNCTION_NAME \
+            --zip-file fileb://function.zip \
+            --region $AWS_REGION
+
+          # コード更新完了を待つ
+          aws lambda wait function-updated \
+            --function-name $FUNCTION_NAME \
+            --region $AWS_REGION
+
+          # 新バージョンを発行（immutable snapshot）
+          NEW_VERSION=$(aws lambda publish-version \
+            --function-name $FUNCTION_NAME \
+            --region $AWS_REGION \
+            --query 'Version' --output text)
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "::notice::New Lambda version published: v$NEW_VERSION"
+
+      # ── Step 3: 現在の安定バージョンを取得 ──
+      - name: Get current stable version
+        id: stable
+        run: |
+          STABLE=$(aws lambda get-alias \
+            --function-name $FUNCTION_NAME \
+            --name $ALIAS_NAME \
+            --region $AWS_REGION \
+            --query 'FunctionVersion' --output text)
+
+          echo "version=$STABLE" >> $GITHUB_OUTPUT
+          echo "::notice::Current stable version: v$STABLE"
+
+      # ── Step 4: カナリア開始（10% → 新バージョン）──
+      - name: Start canary (10% → new version)
+        run: |
+          NEW="${{ steps.deploy.outputs.new_version }}"
+          STABLE="${{ steps.stable.outputs.version }}"
+
+          aws lambda update-alias \
+            --function-name $FUNCTION_NAME \
+            --name $ALIAS_NAME \
+            --function-version $STABLE \
+            --routing-config "{\"AdditionalVersionWeights\": {\"$NEW\": $CANARY_WEIGHT}}" \
+            --region $AWS_REGION
+
+          echo "::notice::Canary started — 90% → v$STABLE / 10% → v$NEW"
+
+      # ── Step 5: スモークテスト（新バージョンに直接 invoke）──
+      - name: Smoke test new version directly
+        run: |
+          NEW="${{ steps.deploy.outputs.new_version }}"
+
+          STATUS=$(aws lambda invoke \
+            --function-name "${FUNCTION_NAME}:${NEW}" \
+            --payload '{"test": true}' \
+            --cli-binary-format raw-in-base64-out \
+            --region $AWS_REGION \
+            --query 'StatusCode' --output text \
+            /tmp/smoke_response.json)
+
+          echo "Response body:"
+          cat /tmp/smoke_response.json
+
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Smoke test failed (status=$STATUS). Will rollback."
+            exit 1
+          fi
+          echo "::notice::Smoke test passed (status=200)"
+
+      # ── Step 6: カナリア監視（CloudWatch でエラー確認）──
+      - name: Monitor canary window (${{ env.CANARY_WAIT_SEC }}s)
+        run: |
+          echo "Monitoring canary for $CANARY_WAIT_SEC seconds..."
+          sleep $CANARY_WAIT_SEC
+
+          END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          START_TIME=$(date -u -d "${CANARY_WAIT_SEC} seconds ago" +%Y-%m-%dT%H:%M:%SZ)
+
+          ERRORS=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/Lambda \
+            --metric-name Errors \
+            --dimensions \
+              Name=FunctionName,Value=$FUNCTION_NAME \
+              Name=Resource,Value="${FUNCTION_NAME}:${ALIAS_NAME}" \
+            --start-time $START_TIME \
+            --end-time $END_TIME \
+            --period $CANARY_WAIT_SEC \
+            --statistics Sum \
+            --region $AWS_REGION \
+            --query 'Datapoints[0].Sum' --output text 2>/dev/null || echo "0")
+
+          # None (データなし) は 0 扱い
+          [ "$ERRORS" = "None" ] && ERRORS=0
+
+          echo "::notice::Errors during canary window: $ERRORS"
+
+          if (( $(echo "$ERRORS > 5" | bc -l) )); then
+            echo "::error::Error count exceeded threshold ($ERRORS > 5). Rolling back."
+            exit 1
+          fi
+
+      # ── Step 7a: 昇格（カナリアが正常 → 100% 切り替え）──
+      - name: Promote canary to 100%
+        if: success()
+        run: |
+          NEW="${{ steps.deploy.outputs.new_version }}"
+
+          aws lambda update-alias \
+            --function-name $FUNCTION_NAME \
+            --name $ALIAS_NAME \
+            --function-version $NEW \
+            --routing-config '{"AdditionalVersionWeights": {}}' \
+            --region $AWS_REGION
+
+          echo "::notice::Promoted v$NEW to 100% — deploy complete"
+
+      # ── Step 7b: ロールバック（スモークテスト or 監視が失敗）──
+      - name: Rollback to stable version
+        if: failure()
+        run: |
+          STABLE="${{ steps.stable.outputs.version }}"
+
+          aws lambda update-alias \
+            --function-name $FUNCTION_NAME \
+            --name $ALIAS_NAME \
+            --function-version $STABLE \
+            --routing-config '{"AdditionalVersionWeights": {}}' \
+            --region $AWS_REGION
+
+          echo "::warning::Rolled back to v$STABLE"

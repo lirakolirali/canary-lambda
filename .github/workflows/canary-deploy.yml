@@ -119,22 +119,30 @@ jobs:
         run: |
           NEW="${{ steps.deploy.outputs.new_version }}"
 
-          STATUS=$(aws lambda invoke \
+          # invoke 結果全体を取得（StatusCode と FunctionError を両方確認）
+          aws lambda invoke \
             --function-name "${FUNCTION_NAME}:${NEW}" \
             --payload '{"test": true}' \
             --cli-binary-format raw-in-base64-out \
             --region $AWS_REGION \
-            --query 'StatusCode' --output text \
-            /tmp/smoke_response.json)
+            /tmp/smoke_response.json > /tmp/invoke_meta.json
 
           echo "Response body:"
           cat /tmp/smoke_response.json
+          echo ""
 
-          if [ "$STATUS" != "200" ]; then
-            echo "::error::Smoke test failed (status=$STATUS). Will rollback."
+          # FunctionError があれば Lambda が例外を投げている
+          FUNCTION_ERROR=$(python3 -c "
+          import json, sys
+          meta = json.load(open('/tmp/invoke_meta.json'))
+          print(meta.get('FunctionError', ''))
+          ")
+
+          if [ -n "$FUNCTION_ERROR" ]; then
+            echo "::error::Smoke test failed: FunctionError=$FUNCTION_ERROR. Will rollback."
             exit 1
           fi
-          echo "::notice::Smoke test passed (status=200)"
+          echo "::notice::Smoke test passed (no FunctionError)"
 
       # ── Step 6: カナリア監視（CloudWatch でエラー確認）──
       - name: Monitor canary window (${{ env.CANARY_WAIT_SEC }}s)
